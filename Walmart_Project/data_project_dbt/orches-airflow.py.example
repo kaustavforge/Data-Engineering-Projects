@@ -1,0 +1,281 @@
+# This file is used to orchestrate the entire Walmart data pipeline using Airflow if s3 buckets files + cdc files are available.
+# Then it runs both things in parallel but it doesn't change the bronze, silver layers
+
+
+# Reviews pipeline ───────┐
+#                         ├─→ clean_target → silver dbt → gold dbt
+# ingest_walmart Job ────┘
+
+
+# import os
+# import time
+
+# from airflow.sdk import dag, task
+# from airflow.operators.bash import BashOperator
+# import pendulum
+
+# @dag(
+#     dag_id="orchestrate",
+#     schedule="0 11 * * *",
+#     catchup=False,
+#     start_date=pendulum.datetime(year=2026, month=10, day=17, tz="Asia/Kolkata")
+# )
+# def orchestrate():
+
+#     @task
+#     def ingest_cdc():
+#         """
+#         Starts the existing Databricks ingest_walmart Job.
+
+#         This Job should contain your main ingest_walmart pipeline.
+#         Airflow waits here until the Databricks Job finishes.
+#         """
+
+#         # Import the Databricks SDK inside the task.
+#         # This prevents Airflow DAG-import timeout problems.
+#         from databricks.sdk import WorkspaceClient
+#         from databricks.sdk.service.jobs import (
+#             RunLifeCycleState,
+#             RunResultState,
+#         )
+
+#         # These values come from airflow/.env.
+#         required_variables = (
+#             "DATABRICKS_HOST",
+#             "DATABRICKS_TOKEN",
+#             "DATABRICKS_JOB_ID",
+#         )
+
+#         # Check that all required Databricks settings exist.
+#         missing_variables = [
+#             name for name in required_variables if not os.environ.get(name)
+#         ]
+
+#         if missing_variables:
+#             raise RuntimeError(
+#                 "Missing required Databricks environment variable(s): "
+#                 + ", ".join(missing_variables)
+#             )
+
+#         # Job IDs must be numeric.
+#         try:
+#             job_id = int(os.environ["DATABRICKS_JOB_ID"])
+#         except ValueError as exc:
+#             raise RuntimeError("DATABRICKS_JOB_ID must be an integer") from exc
+
+#         # Create a Databricks client using the environment variables.
+#         ws = WorkspaceClient(
+#             host=os.environ["DATABRICKS_HOST"],
+#             token=os.environ["DATABRICKS_TOKEN"],
+#         )
+
+#         # Start the existing ingest_walmart Databricks Job.
+#         job_trigger = ws.jobs.run_now(job_id=job_id)
+
+#         print(
+#             f"Started ingest_walmart Databricks Job. " f"Run ID: {job_trigger.run_id}"
+#         )
+
+#         # Keep checking until the Databricks Job finishes.
+#         while True:
+#             job_run = ws.jobs.get_run(job_trigger.run_id)
+
+#             lifecycle_state = job_run.state.life_cycle_state
+#             result_state = job_run.state.result_state
+
+#             print(
+#                 f"Databricks Job lifecycle state: {lifecycle_state}; "
+#                 f"result state: {result_state}"
+#             )
+
+#             # These states mean that the Job has stopped.
+#             if lifecycle_state in [
+#                 RunLifeCycleState.TERMINATED,
+#                 RunLifeCycleState.SKIPPED,
+#                 RunLifeCycleState.INTERNAL_ERROR,
+#             ]:
+#                 # Continue only when Databricks reports success.
+#                 if result_state == RunResultState.SUCCESS:
+#                     print("ingest_walmart Databricks Job " "completed successfully.")
+#                     break
+
+#                 # Fail the Airflow task if Databricks failed.
+#                 raise RuntimeError(
+#                     f"ingest_walmart Databricks Job failed. "
+#                     f"Result state: {result_state}"
+#                 )
+
+#             # Wait before checking the Databricks Job again.
+#             time.sleep(10)
+
+#         return "ingest_walmart Job completed"
+
+#     @task
+#     def run_reviews_pipeline():
+#         """
+#         Starts the separate ST-walmart.gold.reviews pipeline.
+
+#         This pipeline runs in parallel with ingest_cdc().
+#         Airflow waits for this pipeline to finish before starting dbt.
+#         """
+
+#         # Import the SDK only when this task starts.
+#         from databricks.sdk import WorkspaceClient
+#         from databricks.sdk.service.pipelines import UpdateState
+
+#         # The pipeline ID must be stored in airflow/.env.
+#         required_variables = (
+#             "DATABRICKS_HOST",
+#             "DATABRICKS_TOKEN",
+#             "DATABRICKS_REVIEWS_PIPELINE_ID",
+#         )
+
+#         # Check that all required settings exist.
+#         missing_variables = [
+#             name for name in required_variables if not os.environ.get(name)
+#         ]
+
+#         if missing_variables:
+#             raise RuntimeError(
+#                 "Missing required Databricks environment variable(s): "
+#                 + ", ".join(missing_variables)
+#             )
+
+#         # Pipeline IDs are strings in the Databricks SDK.
+#         pipeline_id = os.environ["DATABRICKS_REVIEWS_PIPELINE_ID"]
+
+#         # Create a Databricks client.
+#         ws = WorkspaceClient(
+#             host=os.environ["DATABRICKS_HOST"],
+#             token=os.environ["DATABRICKS_TOKEN"],
+#         )
+
+#         # Start an update for the reviews streaming pipeline.
+#         pipeline_update = ws.pipelines.start_update(pipeline_id=pipeline_id)
+
+#         update_id = pipeline_update.update_id
+
+#         print(f"Started ST-walmart.gold.reviews pipeline. " f"Update ID: {update_id}")
+
+#         # Wait until the reviews pipeline finishes.
+#         while True:
+#             current_update = ws.pipelines.get_update(
+#                 pipeline_id=pipeline_id,
+#                 update_id=update_id,
+#             )
+
+#             state = current_update.update.state
+
+#             print(f"Reviews pipeline state: {state}")
+
+#             # Successful completion.
+#             if state == UpdateState.COMPLETED:
+#                 print("ST-walmart.gold.reviews pipeline " "completed successfully.")
+#                 break
+
+#             # Failure states.
+#             if state in [
+#                 UpdateState.FAILED,
+#                 UpdateState.CANCELED,
+#             ]:
+#                 raise RuntimeError(f"Reviews pipeline failed. State: {state}")
+
+#             # Check again after ten seconds.
+#             time.sleep(10)
+
+#         return "Reviews pipeline completed"
+
+#     @task.bash
+#     def clean_target():
+#         """
+#         Deletes old dbt build files and logs before dbt runs.
+#         """
+#         return (
+#             "rm -rf /opt/airflow/walmart_project/target "
+#             "&& rm -rf /opt/airflow/walmart_project/logs"
+#         )
+
+#     @task.bash
+#     def source_freshness():
+#         """
+#         Checks whether the configured Databricks sources are fresh.
+#         """
+#         return "cd /opt/airflow/walmart_project " "&& dbt source freshness"
+
+#     # Run the silver technical models.
+#     silver_technical = BashOperator(
+#         task_id="silver_technical",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt run --select silver_t",
+#     )
+
+#     # Test the silver technical models.
+#     silver_technical_tests = BashOperator(
+#         task_id="silver_technical_tests",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt test --select silver_t",
+#     )
+
+#     # Run the silver business models.
+#     silver_business = BashOperator(
+#         task_id="silver_business",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt run --select silver_b",
+#     )
+
+#     # Test the silver business models.
+#     silver_business_tests = BashOperator(
+#         task_id="silver_business_tests",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt test --select silver_b",
+#     )
+
+#     # Run the gold ephemeral models.
+#     gold_ephemeral = BashOperator(
+#         task_id="gold_ephemeral",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt run --select gold/ephemeral",
+#     )
+
+#     # Run dbt snapshots for gold dimensions.
+#     gold_dimensions = BashOperator(
+#         task_id="gold_dimensions",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt snapshot",
+#     )
+
+#     # Run the gold fact models.
+#     gold_facts = BashOperator(
+#         task_id="gold_facts",
+#         cwd="/opt/airflow/walmart_project",
+#         bash_command="dbt run --select gold/fact",
+#     )
+
+#     # Create the two independent upstream tasks.
+#     ingest_task = ingest_cdc()
+#     reviews_task = run_reviews_pipeline()
+
+#     # Create the downstream cleanup and dbt tasks.
+#     clean_task = clean_target()
+#     freshness_task = source_freshness()
+
+#     # Both Databricks tasks run in parallel.
+#     #
+#     # Airflow waits for BOTH tasks to succeed before continuing
+#     # to clean_target and the dbt workflow.
+#     (
+#         [ingest_task, reviews_task]
+#         >> clean_task
+#         >> freshness_task
+#         >> silver_technical
+#         >> silver_technical_tests
+#         >> silver_business
+#         >> silver_business_tests
+#         >> gold_ephemeral
+#         >> gold_dimensions
+#         >> gold_facts
+#     )
+
+
+# # Register the DAG with Airflow.
+# orchestrate_dag = orchestrate()
